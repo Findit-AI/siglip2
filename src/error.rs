@@ -416,7 +416,7 @@ impl Error {
   }
 }
 
-/// Crate-local `Result` alias parameterized over [`Error`].
+/// Crate-local `Result` alias parameterized over [`enum@Error`].
 pub type Result<T> = core::result::Result<T, Error>;
 
 #[cfg(test)]

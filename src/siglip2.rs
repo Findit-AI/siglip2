@@ -172,11 +172,79 @@ impl Siglip2 {
   /// `sigmoid(exp(scale)·cos + bias)` probability.
   #[cfg(all(feature = "bundled", target_os = "macos", target_arch = "aarch64"))]
   pub(crate) fn from_mlx_dir(dir: &Path) -> Result<Self> {
-    let model = crate::mlx::MlxModel::from_dir(dir)?;
-    // Prepare the tokenizer the same way `TextEncoder::from_mlx_dir` does:
-    // disable the serialized padding/truncation and install the SigLIP2
-    // lowercasing normalizer (the MLX path builds the fixed-length-64 row
-    // manually under the sticky-EOS contract).
+    // The tokenizer (`dir/tokenizer.json`) is prepared the same way
+    // `TextEncoder::from_mlx_dir` does: disable the serialized padding/truncation
+    // and install the SigLIP2 lowercasing normalizer (the MLX path builds the
+    // fixed-length-64 row manually under the sticky-EOS contract).
+    Self::from_mlx_model_and_tokenizer_dir(crate::mlx::MlxModel::from_dir(dir)?, dir)
+  }
+
+  /// Load both encoders for the **MLX** backend from an exact `model.safetensors`
+  /// file path (Apple Silicon only). The `config.json` and the `tokenizer.json`
+  /// are read from the weight file's parent directory (`weights.parent()`); a
+  /// single shared model backs both encoders and calibration uses the bundled
+  /// pinned release values ([`Calibration::bundled`]).
+  ///
+  /// This is the explicit-format counterpart to the auto-routing
+  /// [`Self::from_dir`]: use it when you already know the checkpoint is an MLX
+  /// safetensors file and where it lives. There is no ONNX fallback — this
+  /// constructor always builds the MLX backend.
+  #[cfg(all(feature = "bundled", target_os = "macos", target_arch = "aarch64"))]
+  pub fn from_safetensors(weights: &Path) -> Result<Self> {
+    Self::from_mlx_model_and_tokenizer_dir(
+      crate::mlx::MlxModel::from_safetensors(weights)?,
+      crate::mlx::weights_parent(weights),
+    )
+  }
+
+  /// Load both encoders for the **MLX** backend from an exact `*.npz` file path
+  /// (Apple Silicon only). The `config.json` and the `tokenizer.json` are read
+  /// from the weight file's parent directory (`weights.parent()`).
+  ///
+  /// Explicit-format MLX constructor (see [`Self::from_safetensors`]); always
+  /// builds the MLX backend, no ONNX fallback.
+  #[cfg(all(
+    feature = "bundled",
+    feature = "npz",
+    target_os = "macos",
+    target_arch = "aarch64"
+  ))]
+  pub fn from_npz(weights: &Path) -> Result<Self> {
+    Self::from_mlx_model_and_tokenizer_dir(
+      crate::mlx::MlxModel::from_npz(weights)?,
+      crate::mlx::weights_parent(weights),
+    )
+  }
+
+  /// Load both encoders for the **MLX** backend from an exact `*.gguf` file path
+  /// (Apple Silicon only). The `config.json` and the `tokenizer.json` are read
+  /// from the weight file's parent directory (`weights.parent()`); the gguf's
+  /// embedded metadata is NOT mapped to a config, so a sibling `config.json` is
+  /// still required.
+  ///
+  /// Explicit-format MLX constructor (see [`Self::from_safetensors`]); always
+  /// builds the MLX backend, no ONNX fallback.
+  #[cfg(all(
+    feature = "bundled",
+    feature = "gguf",
+    target_os = "macos",
+    target_arch = "aarch64"
+  ))]
+  pub fn from_gguf(weights: &Path) -> Result<Self> {
+    Self::from_mlx_model_and_tokenizer_dir(
+      crate::mlx::MlxModel::from_gguf(weights)?,
+      crate::mlx::weights_parent(weights),
+    )
+  }
+
+  /// Assemble a `Siglip2` from an already-loaded shared MLX `model` plus the
+  /// directory its `tokenizer.json` lives in (the checkpoint dir for
+  /// [`Self::from_mlx_dir`], the weight file's parent for the explicit-format
+  /// constructors). Prepares the tokenizer the same way (disable serialized
+  /// padding/truncation + install the SigLIP2 lowercasing normalizer), shares the
+  /// model across both encoders, and uses the bundled pinned calibration.
+  #[cfg(all(feature = "bundled", target_os = "macos", target_arch = "aarch64"))]
+  fn from_mlx_model_and_tokenizer_dir(model: crate::mlx::MlxModel, dir: &Path) -> Result<Self> {
     let tokenizer = crate::text_enc::prepare_mlx_tokenizer(&dir.join("tokenizer.json"))?;
     let image = ImageEncoder::from_mlx_model(model.clone());
     let text = TextEncoder::from_mlx_model(model, tokenizer);
