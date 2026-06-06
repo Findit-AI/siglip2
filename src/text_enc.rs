@@ -17,13 +17,56 @@ use crate::{
 const SEQ_LEN: usize = 64;
 const PAD_TOKEN_ID: u32 = 0;
 
-/// SigLIP2 NaFlex text-tower inference. Owns one `ort::Session` and one
-/// `tokenizers::Tokenizer`.
+/// SigLIP2 NaFlex text-tower inference.
 ///
-/// `TextEncoder: Send + !Sync` — `ort::Session` is `!Sync`. Workers wanting
-/// parallelism instantiate one `TextEncoder` per thread, or share one behind
-/// a `Mutex<TextEncoder>`.
+/// Holds either an ONNX Runtime session + tokenizer (the `ort` backend) or — on
+/// Apple Silicon, when [`Self::from_dir`] auto-routes to it — an `mlxrs` MLX
+/// model + tokenizer (the MLX backend), behind one public API. Both return the
+/// same 768-dim L2-normalized [`Embedding`].
+///
+/// Auto-trait reality is platform-conditional:
+/// - On every target **except** `aarch64-apple-darwin`: `Send + !Sync`. Only the
+///   `ort` backend is compiled; `ort::Session` is `Send` but `!Sync`.
+/// - On `aarch64-apple-darwin`: `!Send + !Sync`. The MLX backend variant is
+///   compiled in unconditionally, and it holds an `Rc`-backed MLX model whose
+///   device handles are not `Send` — so the enum is `!Send` for *every*
+///   `TextEncoder` on this target, including `ort`-backed ones (an enum is
+///   `Send` only if all its variants are).
+///
+/// Either way the type is `!Sync`. Workers wanting parallelism instantiate one
+/// `TextEncoder` per thread; off Apple Silicon they may alternatively share one
+/// behind a `Mutex<TextEncoder>`.
 pub struct TextEncoder {
+  backend: TextBackend,
+}
+
+/// The inference backend behind a [`TextEncoder`].
+enum TextBackend {
+  Ort(OrtTextEncoder),
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  Mlx {
+    model: crate::mlx::MlxModel,
+    tokenizer: Tokenizer,
+  },
+}
+
+impl TextBackend {
+  /// The hard cap on a single batch's length for this backend. Used by
+  /// [`TextEncoder::embed_batch`] to reject an oversized batch (with
+  /// [`Error::BatchTooLarge`]) before the per-item empty scan and before
+  /// dispatch — the ONNX path reads it off [`Options::batch`]'s
+  /// `max_batch_size`; the MLX path off the model's adopted crate-default cap.
+  fn max_batch_size(&self) -> usize {
+    match self {
+      TextBackend::Ort(ort) => ort.max_batch_size(),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      TextBackend::Mlx { model, .. } => model.max_batch_size(),
+    }
+  }
+}
+
+/// The ONNX Runtime text encoder. Owns one `ort::Session` and one tokenizer.
+struct OrtTextEncoder {
   session: ort::session::Session,
   tokenizer: Tokenizer,
   opts: Options,
@@ -69,6 +112,123 @@ impl TextEncoder {
     Self::from_ort_session_with_options(session, tokenizer, opts)
   }
 
+  /// Load the text tower from a **checkpoint directory**, automatically
+  /// picking the best backend for the platform — there is no backend knob.
+  ///
+  /// On Apple Silicon (`aarch64-apple-darwin`) the directory is probed and routes
+  /// to the `mlxrs` **MLX** Metal backend when the text ONNX graph this
+  /// constructor needs (`text_model_naflex.onnx`) is absent and an MLX checkpoint
+  /// (`config.json` + `model.safetensors`) is present; otherwise the **ONNX**
+  /// text graph + the directory's `tokenizer.json` are loaded via ONNX Runtime.
+  /// On every other platform only the ONNX backend is compiled, so that path is
+  /// taken unconditionally.
+  ///
+  /// **Not available on wasm32** (the ONNX session constructors are gated out —
+  /// see [`Self::from_files`]).
+  #[cfg(not(target_arch = "wasm32"))]
+  pub fn from_dir(dir: &Path) -> Result<Self> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if crate::backend_select::prefer_mlx(dir, &[crate::backend_select::TEXT_ONNX]) {
+      return Self::from_mlx_dir(dir);
+    }
+    Self::from_onnx_dir(dir)
+  }
+
+  /// ONNX dispatch target for [`Self::from_dir`]: load the text ONNX graph
+  /// (`crate::backend_select`'s `TEXT_ONNX`) + the directory's `tokenizer.json`.
+  /// Crate-internal — the user's directory entry point is [`Self::from_dir`].
+  #[cfg(not(target_arch = "wasm32"))]
+  pub(crate) fn from_onnx_dir(dir: &Path) -> Result<Self> {
+    Self::from_files(
+      &dir.join(crate::backend_select::TEXT_ONNX),
+      &dir.join("tokenizer.json"),
+    )
+  }
+
+  /// MLX dispatch target for [`Self::from_dir`]: load from an **MLX checkpoint
+  /// directory** (`config.json` + `model.safetensors` + `tokenizer.json`) using
+  /// the `mlxrs` Metal backend.
+  ///
+  /// Crate-internal — the user's directory entry point is [`Self::from_dir`],
+  /// which auto-routes here on Apple Silicon when an MLX checkpoint is present.
+  /// The tokenizer is loaded from `tokenizer.json` in the same directory via
+  /// `prepare_mlx_tokenizer`: its serialized padding/truncation are **disabled**
+  /// (so `encode` returns only the real ids plus the post-processor's appended
+  /// `<eos>`), and the SigLIP2 lowercasing normalizer is installed — the
+  /// fixed-length-64 build then happens manually under `mlxrs`'s SigLIP
+  /// sticky-EOS contract (pad/EOS id `1`), which differs from the standalone
+  /// ONNX text export (pad id `0`).
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  pub(crate) fn from_mlx_dir(dir: &Path) -> Result<Self> {
+    let model = crate::mlx::MlxModel::from_dir(dir)?;
+    let tokenizer = prepare_mlx_tokenizer(&dir.join("tokenizer.json"))?;
+    Ok(Self {
+      backend: TextBackend::Mlx { model, tokenizer },
+    })
+  }
+
+  /// Build from a pre-loaded MLX model and a `Tokenizer` — used by
+  /// `Siglip2::from_mlx_dir` so a single shared model backs both encoders.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  pub(crate) fn from_mlx_model(model: crate::mlx::MlxModel, tokenizer: Tokenizer) -> Self {
+    Self {
+      backend: TextBackend::Mlx { model, tokenizer },
+    }
+  }
+
+  /// Load the **MLX** text tower from an exact `model.safetensors` file path
+  /// (Apple Silicon only). The `config.json` and the `tokenizer.json` are read
+  /// from the weight file's parent directory (`weights.parent()`); the tokenizer
+  /// is prepared via `prepare_mlx_tokenizer` (serialized padding/truncation
+  /// disabled, SigLIP2 lowercasing installed) exactly as [`Self::from_dir`] does.
+  ///
+  /// This is the explicit-format counterpart to the auto-routing
+  /// [`Self::from_dir`]: use it when you already know the checkpoint is an MLX
+  /// safetensors file and where it lives. There is no ONNX fallback — this
+  /// constructor always builds the MLX backend.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  pub fn from_safetensors(weights: &Path) -> Result<Self> {
+    let model = crate::mlx::MlxModel::from_safetensors(weights)?;
+    let tokenizer =
+      prepare_mlx_tokenizer(&crate::mlx::weights_parent(weights).join("tokenizer.json"))?;
+    Ok(Self {
+      backend: TextBackend::Mlx { model, tokenizer },
+    })
+  }
+
+  /// Load the **MLX** text tower from an exact `*.npz` file path (Apple Silicon
+  /// only). The `config.json` and the `tokenizer.json` are read from the weight
+  /// file's parent directory (`weights.parent()`).
+  ///
+  /// Explicit-format MLX constructor (see [`Self::from_safetensors`]); always
+  /// builds the MLX backend, no ONNX fallback.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "npz"))]
+  pub fn from_npz(weights: &Path) -> Result<Self> {
+    let model = crate::mlx::MlxModel::from_npz(weights)?;
+    let tokenizer =
+      prepare_mlx_tokenizer(&crate::mlx::weights_parent(weights).join("tokenizer.json"))?;
+    Ok(Self {
+      backend: TextBackend::Mlx { model, tokenizer },
+    })
+  }
+
+  /// Load the **MLX** text tower from an exact `*.gguf` file path (Apple Silicon
+  /// only). The `config.json` and the `tokenizer.json` are read from the weight
+  /// file's parent directory (`weights.parent()`); the gguf's embedded metadata
+  /// is NOT mapped to a config, so a sibling `config.json` is still required.
+  ///
+  /// Explicit-format MLX constructor (see [`Self::from_safetensors`]); always
+  /// builds the MLX backend, no ONNX fallback.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "gguf"))]
+  pub fn from_gguf(weights: &Path) -> Result<Self> {
+    let model = crate::mlx::MlxModel::from_gguf(weights)?;
+    let tokenizer =
+      prepare_mlx_tokenizer(&crate::mlx::weights_parent(weights).join("tokenizer.json"))?;
+    Ok(Self {
+      backend: TextBackend::Mlx { model, tokenizer },
+    })
+  }
+
   /// Construct from a caller-built `ort::Session` and `Tokenizer`,
   /// using crate-default [`Options`]. On wasm32 this is the supported
   /// entry point because `ort 2.0.0-rc.12` cfg-gates `commit_from_file`
@@ -91,17 +251,19 @@ impl TextEncoder {
     // `embed_batch`.
     opts.batch().validate()?;
     Ok(Self {
-      session,
-      tokenizer,
-      opts,
-      input_ids_scratch: Vec::new(),
+      backend: TextBackend::Ort(OrtTextEncoder {
+        session,
+        tokenizer,
+        opts,
+        input_ids_scratch: Vec::new(),
+      }),
     })
   }
 
   /// Encode a single string and return its 768-dim L2-normalized
   /// [`Embedding`]. Empty input is rejected with [`Error::EmptyText`].
   /// For multiple inputs, prefer [`Self::embed_batch`] — it amortizes
-  /// the per-call ORT overhead across the batch.
+  /// the per-call inference overhead across the batch.
   pub fn embed(&mut self, text: &str) -> Result<Embedding> {
     if text.is_empty() {
       return Err(Error::EmptyText);
@@ -110,21 +272,24 @@ impl TextEncoder {
     Ok(out.remove(0))
   }
 
-  /// Returns `Ok(vec![])` for an empty input slice (no ORT call).
-  /// Returns `Error::BatchTooLarge` when `texts.len() > opts.batch.max_batch_size`.
-  /// Internally chunks `texts` into groups of size `BatchOptions::batch_size`
-  /// and runs one ORT inference per chunk; the returned `Vec` preserves
-  /// input order and has the same length as `texts` on success.
+  /// Returns `Ok(vec![])` for an empty input slice (no inference call).
+  /// The returned `Vec` preserves input order and has the same length as
+  /// `texts` on success.
   ///
   /// **Failure semantics.** Aborts on the first failing input and returns
   /// `Error::Batch { index, source }` carrying the offending zero-based
-  /// index — symmetric with `ImageEncoder::embed_pixels_batch`. Already-
-  /// computed embeddings from earlier chunks are dropped.
+  /// index — symmetric with `ImageEncoder::embed_pixels_batch`.
   pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Embedding>> {
     if texts.is_empty() {
       return Ok(Vec::new());
     }
-    let max = self.opts.batch().max_batch_size();
+    // Reject an oversized batch BEFORE the per-item empty scan and BEFORE
+    // dispatching to the backend, so an oversized batch that *also* contains an
+    // empty string returns `Error::BatchTooLarge` (the batch-shape problem), not
+    // `Error::Batch { source: EmptyText }`. This mirrors the ordering on the
+    // default ONNX path: (1) empty slice; (2) max-batch cap; (3) per-item empty
+    // scan; (4) dispatch.
+    let max = self.backend.max_batch_size();
     if texts.len() > max {
       return Err(Error::BatchTooLarge {
         got: texts.len(),
@@ -134,11 +299,44 @@ impl TextEncoder {
     // Surface the offending index — `Error::Batch { index, source }` is
     // the documented batched-failure shape, so a `classify` call with
     // 100 labels where one is `""` can identify the bad record for
-    // retry / cleanup.
+    // retry / cleanup. Checked for both backends.
     if let Some((index, _)) = texts.iter().enumerate().find(|(_, t)| t.is_empty()) {
       return Err(Error::Batch {
         index,
         source: Box::new(Error::EmptyText),
+      });
+    }
+    match &mut self.backend {
+      TextBackend::Ort(ort) => ort.embed_batch(texts),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      TextBackend::Mlx { model, tokenizer } => model.embed_text_batch(tokenizer, texts),
+    }
+  }
+
+  /// Run a single throwaway inference to amortize first-call cost.
+  pub fn warmup(&mut self) -> Result<()> {
+    let _ = self.embed("warmup")?;
+    Ok(())
+  }
+}
+
+impl OrtTextEncoder {
+  /// The configured per-batch cap ([`Options::batch`]'s `max_batch_size`).
+  /// Read by [`TextEncoder::embed_batch`] before dispatch so the outer
+  /// max-batch guard matches the default ONNX path's historical ordering.
+  fn max_batch_size(&self) -> usize {
+    self.opts.batch().max_batch_size()
+  }
+
+  /// Returns `Error::BatchTooLarge` when `texts.len() > opts.batch.max_batch_size`.
+  /// Internally chunks `texts` into groups of size `BatchOptions::batch_size`
+  /// and runs one ORT inference per chunk.
+  fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Embedding>> {
+    let max = self.opts.batch().max_batch_size();
+    if texts.len() > max {
+      return Err(Error::BatchTooLarge {
+        got: texts.len(),
+        max,
       });
     }
     // `batch_size >= 1` is guaranteed by `BatchOptions::validate` at
@@ -160,15 +358,6 @@ impl TextEncoder {
     );
     self.input_ids_scratch = input_ids;
     result
-  }
-
-  /// Run a single throwaway inference to amortize ORT's first-call
-  /// graph-compilation cost. Subsequent `embed` / `embed_batch` calls
-  /// avoid the cold-start latency the first real call would otherwise
-  /// pay.
-  pub fn warmup(&mut self) -> Result<()> {
-    let _ = self.embed("warmup")?;
-    Ok(())
   }
 }
 
@@ -216,6 +405,82 @@ fn validate_text_session(session: &ort::session::Session) -> Result<()> {
   Ok(())
 }
 
+/// Prepend a `Lowercase` normalizer to whatever the loaded `tokenizer.json`
+/// already carries (the bundled JSON has `Replace(" ", "▁")` for the
+/// SentencePiece marker — see the normalizer field of `models/tokenizer.json`).
+///
+/// Upstream `transformers.models.siglip2.tokenization_siglip2.Siglip2Tokenizer`
+/// does the same wrap at runtime in its `__init__`:
+/// `backend.normalizer = Sequence([Lowercase(), backend.normalizer])`. The
+/// `Lowercase` step is NOT serialized into the exported `tokenizer.json`, so a
+/// Rust caller loading the JSON directly (without going through the Python
+/// `Siglip2Tokenizer` class) would silently encode mixed-case input differently
+/// from upstream — different token ids → different embeddings → wrong retrieval
+/// / `classify` rankings.
+///
+/// Shared by both backends: the ORT path applies it inside
+/// [`configure_padding`]; the MLX path applies it directly (the MLX path keeps
+/// its own pad/EOS policy and must NOT re-enable the ORT padding/truncation, so
+/// only the lowercasing is factored out here, not the whole `configure_padding`).
+///
+/// `with_normalizer` returns `Result` because it calls
+/// `refresh_normalized_tokens`, which iterates added tokens with
+/// `normalized = true` and re-applies the new normalizer; the normalizer's own
+/// `normalize()` is fallible. The bundled SigLIP2 tokenizer never trips this
+/// path, but `from_files` / `from_ort_session` / `from_mlx_dir` accept
+/// arbitrary on-disk tokenizers, so an `expect` here would turn a bad asset
+/// into a process panic during construction. Surface as `Error::Tokenizer`
+/// instead, in line with every other fallible step on these loader paths.
+fn apply_siglip_lowercase(tokenizer: &mut Tokenizer) -> Result<()> {
+  let existing = tokenizer.get_normalizer().cloned();
+  let mut wrapped: Vec<NormalizerWrapper> = vec![Lowercase.into()];
+  if let Some(n) = existing {
+    wrapped.push(n);
+  }
+  tokenizer
+    .with_normalizer(Some(NormalizerSequence::new(wrapped)))
+    .map_err(|e| Error::Tokenizer(e.to_string()))?;
+  Ok(())
+}
+
+/// Load and prepare the tokenizer for the **MLX** text path from `tokenizer.json`.
+///
+/// The serialized SigLIP2 `tokenizer.json` carries its own padding
+/// (`Fixed(64)`, pad id `0`) and truncation (`max_length = 64`). Left enabled,
+/// `encode` would return an already-64-long row right-padded with id `0`, and
+/// the MLX path's `fill_fixed_length_row` would mis-read those interior `0`-pads
+/// as real tokens (the text tower has no attention mask) — and an overlength
+/// prompt would be silently truncated to exactly 64 ids, defeating the
+/// sticky-EOS forcing. So we **disable** the tokenizer's built-in padding AND
+/// truncation here: `encode` then returns only the real ids (plus the
+/// post-processor's appended `<eos>`), from which the MLX path builds the
+/// fixed-length-64 row manually under the SigLIP sticky-EOS contract
+/// (pad/EOS id `1`, sticky-EOS only on a TRUE overlength), byte-identical to
+/// `mlxrs`'s `Padding::FixedLength { length: 64, pad_token_id: 1,
+/// eos_token_id: Some(1) }`.
+///
+/// The SigLIP2 lowercasing normalizer (the runtime
+/// `Sequence([Lowercase, …])` wrap the serialized JSON lacks) is installed via
+/// the shared [`apply_siglip_lowercase`], so mixed-case prompts encode the same
+/// as on the ORT path. The MLX-specific pad/EOS policy is kept separate — the
+/// ORT padding/truncation is NOT re-enabled here.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn prepare_mlx_tokenizer(tokenizer_json: &Path) -> Result<Tokenizer> {
+  let mut tokenizer =
+    Tokenizer::from_file(tokenizer_json).map_err(|e| Error::Tokenizer(e.to_string()))?;
+  // Disable the serialized padding/truncation so `encode` yields only the real
+  // ids (+ the post-processor's EOS); the fixed-length-64 row is built manually
+  // by the MLX path. `with_truncation(None)` is infallible (it only errors on
+  // `stride > max_length`, irrelevant when clearing); `with_padding` is
+  // infallible.
+  tokenizer
+    .with_truncation(None)
+    .map_err(|e| Error::Tokenizer(e.to_string()))?;
+  tokenizer.with_padding(None);
+  apply_siglip_lowercase(&mut tokenizer)?;
+  Ok(tokenizer)
+}
+
 fn configure_padding(mut tokenizer: Tokenizer) -> Result<Tokenizer> {
   // The text ONNX graph takes ONLY `input_ids` (no separate
   // `attention_mask`); the model handles padding internally via the
@@ -238,34 +503,9 @@ fn configure_padding(mut tokenizer: Tokenizer) -> Result<Tokenizer> {
     )));
   }
 
-  // Prepend a `Lowercase` normalizer to whatever the loaded tokenizer.json
-  // already carries (the bundled JSON has `Replace(" ", "▁")` for the
-  // SentencePiece marker — see normalizer field of models/tokenizer.json).
-  // Upstream `transformers.models.siglip2.tokenization_siglip2.Siglip2Tokenizer`
-  // does the same wrap at runtime in its `__init__` (lines 95-96 of that
-  // file): `backend.normalizer = Sequence([Lowercase(), backend.normalizer])`.
-  // The `Lowercase` step is NOT serialized into the exported tokenizer.json,
-  // so a Rust caller loading the JSON directly (without going through the
-  // Python `Siglip2Tokenizer` class) would silently encode mixed-case input
-  // differently from upstream — different token ids → different embeddings
-  // → wrong retrieval / `classify` rankings.
-  let existing = tokenizer.get_normalizer().cloned();
-  let mut wrapped: Vec<NormalizerWrapper> = vec![Lowercase.into()];
-  if let Some(n) = existing {
-    wrapped.push(n);
-  }
-  // `with_normalizer` returns `Result` because it calls
-  // `refresh_normalized_tokens`, which iterates added tokens with
-  // `normalized = true` and re-applies the new normalizer; the
-  // normalizer's own `normalize()` is fallible. The bundled SigLIP2
-  // tokenizer never trips this path, but `from_files` /
-  // `from_ort_session` accept arbitrary caller-supplied tokenizers,
-  // so `expect` here would turn a bad asset into a process panic
-  // during construction. Surface as `Error::Tokenizer` instead, in
-  // line with every other fallible step on this loader path.
-  tokenizer
-    .with_normalizer(Some(NormalizerSequence::new(wrapped)))
-    .map_err(|e| Error::Tokenizer(e.to_string()))?;
+  // Install the SigLIP2 lowercasing normalizer (shared with the MLX text
+  // path — see [`apply_siglip_lowercase`]).
+  apply_siglip_lowercase(&mut tokenizer)?;
 
   // Pad short inputs to SEQ_LEN. `Fixed` only pads — long inputs are not
   // truncated by padding alone, so we also configure truncation below.
@@ -469,5 +709,124 @@ mod tests {
       }
       _ => panic!("expected Error::Tokenizer, got {err}"),
     }
+  }
+
+  // ─────────────────── MLX text-path construction parity ───────────────────
+  //
+  // These assert the `(batch, 64)` `input_ids` the MLX path constructs from the
+  // *real* checkpoint tokenizer (`prepare_mlx_tokenizer`) against the SigLIP2
+  // sticky-EOS fixed-length contract, without the GPU model:
+  //   1. a SHORT prompt pads with the sticky-EOS id (1), never interior 0-pads
+  //      (the tokenizer's serialized `Fixed(64)`-pad-0 + truncation are off);
+  //   2. MIXED-CASE prompts (HELLO vs hello) build identical ids (lowercasing);
+  //   3. an OVERLENGTH prompt is head-truncated with EOS forced into the last
+  //      slot.
+  // Gated on `SIGLIP2_MLX_DIR` (the MLX checkpoint dir holding `tokenizer.json`)
+  // and the Apple-Silicon cfg (the only place the MLX backend compiles). Run
+  // with `SIGLIP2_MLX_DIR=… cargo test … -- --ignored`.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  const MLX_SEQ_LEN: usize = 64;
+
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  fn mlx_tokenizer_from_env() -> Tokenizer {
+    let dir = std::env::var_os("SIGLIP2_MLX_DIR")
+      .map(std::path::PathBuf::from)
+      .expect("SIGLIP2_MLX_DIR not set");
+    prepare_mlx_tokenizer(&dir.join("tokenizer.json"))
+      .unwrap_or_else(|e| panic!("prepare_mlx_tokenizer failed for {}: {e}", dir.display()))
+  }
+
+  /// SHORT prompt: the constructed row is exactly `MLX_SEQ_LEN` long, holds the
+  /// real ids at its head, pads the remainder with the sticky-EOS id (`1`), and
+  /// contains NO interior pad id `0` — which the tokenizer's own `Fixed(64)`
+  /// padding (pad id 0), left enabled, would leak into the row as real tokens.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[test]
+  #[ignore = "requires SIGLIP2_MLX_DIR (an MLX checkpoint directory)"]
+  fn mlx_short_prompt_ids_pad_with_eos_not_zero() {
+    let tok = mlx_tokenizer_from_env();
+    let texts = ["a cat"];
+    let ids = crate::mlx::build_text_input_ids(&tok, &texts, MLX_SEQ_LEN)
+      .expect("build_text_input_ids must succeed");
+    assert_eq!(ids.len(), MLX_SEQ_LEN, "single short row must be one seq");
+
+    // The real (non-padded) length is what the prepared tokenizer emits with
+    // padding disabled — recompute it to locate the pad boundary.
+    let real = tok.encode("a cat", true).expect("encode").get_ids().len();
+    assert!(
+      real < MLX_SEQ_LEN,
+      "test prompt must be shorter than the fixed length (got {real})"
+    );
+    // Trailing cells past the real ids are all the sticky-EOS id (1).
+    assert!(
+      ids[real..].iter().all(|&v| v == 1),
+      "padding must be the sticky-EOS id 1, got {:?}",
+      &ids[real..]
+    );
+    // No interior pad id 0 anywhere in the row.
+    assert!(
+      !ids.contains(&0),
+      "a short prompt must not contain pad id 0: {ids:?}"
+    );
+  }
+
+  /// MIXED CASE: `HELLO` and `hello` build byte-identical ids, because
+  /// `prepare_mlx_tokenizer` installs the SigLIP2 lowercasing normalizer the
+  /// serialized `tokenizer.json` lacks. Without it the uppercase form tokenizes
+  /// to different ids (SPM `<unk>` / cased pieces).
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[test]
+  #[ignore = "requires SIGLIP2_MLX_DIR (an MLX checkpoint directory)"]
+  fn mlx_mixed_case_ids_match_lowercase() {
+    let tok = mlx_tokenizer_from_env();
+    let upper =
+      crate::mlx::build_text_input_ids(&tok, &["HELLO WORLD"], MLX_SEQ_LEN).expect("encode upper");
+    let lower =
+      crate::mlx::build_text_input_ids(&tok, &["hello world"], MLX_SEQ_LEN).expect("encode lower");
+    assert_eq!(
+      upper, lower,
+      "lowercasing must make HELLO WORLD and hello world build identical ids"
+    );
+    // Guard against a degenerate all-pad row making the equality vacuous.
+    assert!(
+      lower.iter().any(|&v| v != 1),
+      "the prompt must produce real (non-pad) content ids"
+    );
+  }
+
+  /// OVERLENGTH: a prompt whose real ids exceed `MLX_SEQ_LEN` is head-truncated
+  /// to `MLX_SEQ_LEN - 1` content ids with the sticky-EOS id (`1`) forced into
+  /// the final pooled slot (HF truncate-then-append-EOS).
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  #[test]
+  #[ignore = "requires SIGLIP2_MLX_DIR (an MLX checkpoint directory)"]
+  fn mlx_overlength_prompt_forces_sticky_eos() {
+    let tok = mlx_tokenizer_from_env();
+    // A long prompt comfortably exceeding 64 tokens once tokenized.
+    let long = "word ".repeat(200);
+    let real = tok
+      .encode(long.clone(), true)
+      .expect("encode")
+      .get_ids()
+      .len();
+    assert!(
+      real > MLX_SEQ_LEN,
+      "test prompt must exceed the fixed length (got {real})"
+    );
+    let ids = crate::mlx::build_text_input_ids(&tok, &[long.as_str()], MLX_SEQ_LEN)
+      .expect("build overlength ids");
+    assert_eq!(ids.len(), MLX_SEQ_LEN);
+    // Final slot is the forced sticky EOS (1), never a content token.
+    assert_eq!(
+      ids[MLX_SEQ_LEN - 1],
+      1,
+      "the last pooled slot must be the sticky EOS id 1 on a truncated prompt"
+    );
+    // The head is real content (the first ids of the tokenized prompt), so the
+    // row is not all-pad.
+    assert!(
+      ids[..MLX_SEQ_LEN - 1].iter().any(|&v| v != 1),
+      "the truncated head must carry real content ids"
+    );
   }
 }

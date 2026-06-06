@@ -46,7 +46,7 @@ impl Preprocessor {
   /// [`Error::MaxNumPatchesMismatch`] if the options' `max_num_patches`
   /// is not exactly [`Self::MAX_NUM_PATCHES`] (the only value the
   /// 0.1.0 ONNX export supports), and propagates batch-options
-  /// validation errors from [`crate::BatchOptions::validate`].
+  /// validation errors from `crate::BatchOptions::validate`.
   pub fn new(opts: Options) -> Result<Self> {
     let opt = opts.batch().max_num_patches();
     if opt != Self::MAX_NUM_PATCHES {

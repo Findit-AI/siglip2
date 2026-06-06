@@ -31,7 +31,7 @@ The package is `siglip2-naflex` on crates.io but the lib name is
 
 ## Examples
 
-Runnable examples live in [`examples/`](examples). Notable entry
+Runnable examples live in [`examples/`](./examples/). Notable entry
 points:
 
 - `embed_keyframes.rs` — single-tower `ImageEncoder` over a directory

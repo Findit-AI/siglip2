@@ -49,6 +49,12 @@ fn types_are_send_sync() {
   req::<siglip2_naflex::Calibration>();
 }
 
+// The `ort`-backed encoders are `Send` (`ort::Session` is `Send`). The MLX
+// backend, which compiles unconditionally on Apple Silicon, embeds an
+// `mlxrs::Siglip2NaflexModel` that holds `!Send` MLX device-array handles, so
+// an MLX-backed encoder is single-threaded by construction. Assert `Send` only
+// off Apple Silicon, where the `ort` backend is the only one compiled.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 #[test]
 fn encoders_are_send() {
   fn req<T: Send>() {}
@@ -148,6 +154,50 @@ fn text_parity_against_pytorch_reference() {
       prompts[i]
     );
   }
+}
+
+// `Siglip2::from_dir` must read the **directory's** `tokenizer.json`, not the
+// embedded `BUNDLED_TOKENIZER`. The composed `from_onnx_dir` delegates its text
+// side to `TextEncoder::from_onnx_dir(dir)` (which loads `dir/tokenizer.json`),
+// so a `Siglip2` built from the directory must embed any prompt byte-identically
+// to a standalone `TextEncoder` built from the same directory — proving the
+// directory tokenizer (not the bundled one) is the one driving the text tower.
+// Before the fix `Siglip2::from_onnx_dir` called `Self::bundled`, which loaded
+// the embedded tokenizer and would silently diverge for a checkpoint shipping
+// its own `tokenizer.json`. Gated on `feature = "bundled"` (the gate on
+// `from_dir`) and `SIGLIP2_MODELS_DIR` (the released ONNX graphs + tokenizer).
+#[cfg(feature = "bundled")]
+#[test]
+#[ignore = "requires SIGLIP2_MODELS_DIR"]
+fn siglip2_from_dir_uses_directory_tokenizer() {
+  let dir = models_dir().expect("SIGLIP2_MODELS_DIR not set");
+
+  // The standalone text encoder loads `dir/tokenizer.json` (its `from_onnx_dir`
+  // path), giving the reference token-id behavior for this directory.
+  let mut text_only =
+    siglip2_naflex::TextEncoder::from_dir(&dir).expect("TextEncoder::from_dir must load");
+
+  // The high-level wrapper must drive its text tower with that SAME directory
+  // tokenizer — not the embedded `BUNDLED_TOKENIZER`.
+  let mut s = siglip2_naflex::Siglip2::from_dir(&dir).expect("Siglip2::from_dir must load");
+
+  // A mixed-case prompt exercises the lowercasing normalizer too; if the wrapper
+  // were using a different tokenizer the embeddings would diverge.
+  let prompt = "HELLO a photo of a cat";
+  let from_wrapper = s
+    .text()
+    .embed(prompt)
+    .expect("wrapper text embed must succeed");
+  let from_standalone = text_only
+    .embed(prompt)
+    .expect("standalone text embed must succeed");
+
+  let cos = from_wrapper.cosine(&from_standalone);
+  assert!(
+    cos >= 0.999_99,
+    "Siglip2::from_dir must use the directory tokenizer (cosine vs standalone \
+     TextEncoder::from_dir was {cos}, expected ~1.0)"
+  );
 }
 
 // Uses `Siglip2::from_files`, which loads `calibration.json` via
@@ -279,6 +329,36 @@ fn embed_batch_empty_text_surfaces_index() {
       );
     }
     _ => panic!("expected Error::Batch, got {err}"),
+  }
+}
+
+/// An oversized batch that *also* contains an empty string must return
+/// `Error::BatchTooLarge` (the batch-shape problem), NOT
+/// `Error::Batch { source: EmptyText }`. The max-batch cap is checked before
+/// the per-item empty scan in the outer `embed_batch`, so the batch-size
+/// failure wins — restoring the historical ONNX-path ordering (empty slice →
+/// max-batch cap → per-item empty scan → dispatch).
+#[test]
+#[ignore = "requires SIGLIP2_MODELS_DIR"]
+fn embed_batch_oversized_with_empty_reports_too_large_first() {
+  use siglip2_naflex::{BatchOptions, Options};
+
+  let dir = models_dir().expect("SIGLIP2_MODELS_DIR not set");
+  // Tight cap: max_batch_size = 2.
+  let opts = Options::default().with_batch(BatchOptions::default().with_max_batch_size(2));
+  let mut enc = siglip2_naflex::TextEncoder::from_files_with_options(
+    &dir.join("text_model_naflex.onnx"),
+    &dir.join("tokenizer.json"),
+    opts,
+  )
+  .expect("encoder must load");
+
+  // 4 items (> cap of 2) AND position 1 is empty. The max-batch check must win.
+  let texts = ["a photo of a sunset", "", "a screenshot", "an MRI scan"];
+  let err = enc.embed_batch(&texts).unwrap_err();
+  match err {
+    siglip2_naflex::Error::BatchTooLarge { got: 4, max: 2 } => {}
+    _ => panic!("expected BatchTooLarge {{ got: 4, max: 2 }} (not Batch/EmptyText), got {err}"),
   }
 }
 
@@ -442,5 +522,170 @@ fn batched_embedding_matches_single_image() {
       "image {i} ({stem}): batched vs single cosine {cos} below 0.99999 \
        — batching is influencing per-image output beyond f32 rounding"
     );
+  }
+}
+
+// ───────────────────────── MLX backend parity ──────────────────────────
+//
+// Runs the committed PyTorch-reference fixture images through the MLX
+// (`mlxrs`) backend and compares each embedding to the same reference `.npy`
+// the ORT parity test uses. Gated on Apple Silicon (the only place the backend
+// compiles) and on `SIGLIP2_MLX_DIR` pointing at an MLX checkpoint directory
+// (`config.json` + `model.safetensors` + `tokenizer.json`); `from_dir`
+// auto-routes that directory to MLX. The MLX path resamples with a PIL-bit-exact
+// bilinear (the upstream HF processor's filter), so it is expected to track the
+// reference at least as closely as the ORT path's `image`-rs `Triangle` resize.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+#[ignore = "requires SIGLIP2_MLX_DIR (an MLX checkpoint directory)"]
+fn mlx_image_parity_against_pytorch_reference() {
+  let dir = std::env::var_os("SIGLIP2_MLX_DIR")
+    .map(PathBuf::from)
+    .expect("SIGLIP2_MLX_DIR not set");
+  // `from_dir` auto-routes to MLX on Apple Silicon when `SIGLIP2_MLX_DIR` holds
+  // an MLX checkpoint (`config.json` + `model.safetensors`) — there is no
+  // public MLX-specific constructor; the platform picks the backend.
+  let mut enc = siglip2_naflex::ImageEncoder::from_dir(&dir).unwrap_or_else(|e| {
+    panic!(
+      "failed to load MLX image encoder from {}: {e}",
+      dir.display()
+    )
+  });
+
+  let images_dir = fixture_dir().join("images");
+  let embeddings_dir = fixture_dir().join("embeddings");
+  let mut entries: Vec<_> = std::fs::read_dir(&images_dir)
+    .unwrap_or_else(|e| panic!("fixture images missing at {}: {e}", images_dir.display()))
+    .filter_map(|e| e.ok())
+    .filter(|e| e.path().extension().is_some_and(|x| x == "png"))
+    .collect();
+  entries.sort_by_key(|e| e.file_name());
+  assert!(!entries.is_empty(), "no .png fixtures found");
+
+  let mut min_cos = f32::INFINITY;
+  for entry in entries {
+    let path = entry.path();
+    let img = image::ImageReader::open(&path)
+      .unwrap()
+      .decode()
+      .unwrap()
+      .to_rgb8();
+    let (w, h) = img.dimensions();
+    let view = siglip2_naflex::ImageView::new(img.as_raw(), w, h).unwrap();
+    let got = enc.embed_pixels(view).unwrap();
+
+    let stem = path.file_stem().unwrap().to_string_lossy();
+    let expected = load_npy_f32_1d(&embeddings_dir.join(format!("{stem}.npy")));
+    let expected_embedding = siglip2_naflex::Embedding::try_from(expected)
+      .unwrap_or_else(|e| panic!("reference embedding for {stem} failed validation: {e}"));
+
+    let cos = got.cosine(&expected_embedding);
+    min_cos = min_cos.min(cos);
+    // The MLX path's resize filter is the upstream PIL-bit-exact bilinear (the
+    // reference HF processor's filter), so it tracks the PyTorch reference far
+    // more tightly than the ORT path's `image`-rs `Triangle` (documented
+    // 0.99917 floor): the measured min cosine across the fixture set is
+    // ~0.9999999. This 0.9995 floor is a comfortable regression guard.
+    assert!(
+      cos >= 0.9995,
+      "{stem}: MLX-vs-PyTorch cosine {cos} below 0.9995 floor"
+    );
+  }
+  eprintln!("MLX image parity: min cosine vs PyTorch reference = {min_cos}");
+}
+
+// End-to-end text parity for the MLX backend: a MIXED-CASE prompt and its
+// lowercase form must embed identically (the SigLIP2 lowercasing normalizer the
+// serialized tokenizer.json lacks is installed by `prepare_mlx_tokenizer`).
+// Exercises the full GPU text tower, complementing the GPU-free input_ids unit
+// tests in `src/text_enc.rs`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+#[ignore = "requires SIGLIP2_MLX_DIR (an MLX checkpoint directory)"]
+fn mlx_text_mixed_case_embeds_identically() {
+  let dir = std::env::var_os("SIGLIP2_MLX_DIR")
+    .map(PathBuf::from)
+    .expect("SIGLIP2_MLX_DIR not set");
+  // `from_dir` auto-routes to MLX on Apple Silicon when `SIGLIP2_MLX_DIR` holds
+  // an MLX checkpoint — there is no public MLX-specific constructor.
+  let mut enc = siglip2_naflex::TextEncoder::from_dir(&dir).unwrap_or_else(|e| {
+    panic!(
+      "failed to load MLX text encoder from {}: {e}",
+      dir.display()
+    )
+  });
+
+  let upper = enc.embed("A PHOTO OF A CAT").expect("embed upper");
+  let lower = enc.embed("a photo of a cat").expect("embed lower");
+  let cos = upper.cosine(&lower);
+  assert!(
+    cos >= 0.99999,
+    "mixed-case and lowercase prompts must embed identically (cosine {cos}); \
+     the SigLIP2 lowercasing normalizer is missing"
+  );
+}
+
+// The MLX TEXT batch path rejects an oversized batch with the typed
+// `BatchTooLarge` (the same contract as the ORT path) BEFORE allocating /
+// running — not a panic / OOM. The crate-default cap is 1024, so 1025 entries
+// trip it; the strings are never tokenized because the cap check is first.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+#[ignore = "requires SIGLIP2_MLX_DIR (an MLX checkpoint directory)"]
+fn mlx_text_batch_rejects_oversized() {
+  let dir = std::env::var_os("SIGLIP2_MLX_DIR")
+    .map(PathBuf::from)
+    .expect("SIGLIP2_MLX_DIR not set");
+  // `from_dir` auto-routes to MLX on Apple Silicon when `SIGLIP2_MLX_DIR` holds
+  // an MLX checkpoint — there is no public MLX-specific constructor.
+  let mut enc = siglip2_naflex::TextEncoder::from_dir(&dir).unwrap_or_else(|e| {
+    panic!(
+      "failed to load MLX text encoder from {}: {e}",
+      dir.display()
+    )
+  });
+
+  let over = 1025usize; // default max_batch_size is 1024
+  let texts: Vec<&str> = vec!["x"; over];
+  match enc.embed_batch(&texts) {
+    Err(siglip2_naflex::Error::BatchTooLarge { got, max }) => {
+      assert_eq!(got, over);
+      assert_eq!(max, 1024);
+    }
+    other => panic!("expected BatchTooLarge {{ got: {over}, max: 1024 }}, got {other:?}"),
+  }
+}
+
+// The MLX IMAGE batch path rejects an oversized batch with the typed
+// `BatchTooLarge` BEFORE allocating / running, symmetric with the text path and
+// the ORT path. The 1025 `ImageView`s share one tiny RGB buffer; the cap check
+// runs before any preprocessing / GPU work.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+#[ignore = "requires SIGLIP2_MLX_DIR (an MLX checkpoint directory)"]
+fn mlx_image_batch_rejects_oversized() {
+  let dir = std::env::var_os("SIGLIP2_MLX_DIR")
+    .map(PathBuf::from)
+    .expect("SIGLIP2_MLX_DIR not set");
+  // `from_dir` auto-routes to MLX on Apple Silicon when `SIGLIP2_MLX_DIR` holds
+  // an MLX checkpoint (`config.json` + `model.safetensors`) — there is no
+  // public MLX-specific constructor; the platform picks the backend.
+  let mut enc = siglip2_naflex::ImageEncoder::from_dir(&dir).unwrap_or_else(|e| {
+    panic!(
+      "failed to load MLX image encoder from {}: {e}",
+      dir.display()
+    )
+  });
+
+  let rgb = vec![128u8; 8 * 8 * 3];
+  let view = siglip2_naflex::ImageView::new(&rgb, 8, 8).expect("view");
+  let over = 1025usize;
+  let views: Vec<siglip2_naflex::ImageView<'_>> = vec![view; over];
+  match enc.embed_pixels_batch(&views) {
+    Err(siglip2_naflex::Error::BatchTooLarge { got, max }) => {
+      assert_eq!(got, over);
+      assert_eq!(max, 1024);
+    }
+    other => panic!("expected BatchTooLarge {{ got: {over}, max: 1024 }}, got {other:?}"),
   }
 }

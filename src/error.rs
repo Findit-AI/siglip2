@@ -370,9 +370,53 @@ pub enum Error {
   /// tokenizer paths, decoder I/O, etc.).
   #[error(transparent)]
   Io(#[from] std::io::Error),
+
+  /// Error from the MLX (`mlxrs`) inference backend — checkpoint load,
+  /// NaFlex preprocessing, tokenization, or a tower forward pass. Compiled only
+  /// on the Apple-Silicon target, the only place the backend exists. The
+  /// `mlxrs::Error` is captured as its `Display` string so this crate's public
+  /// `Error` does not leak the `mlxrs` type into its API.
+  #[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+  #[error("mlx backend error: {0}")]
+  Mlx(
+    /// Human-readable description of the MLX backend failure.
+    String,
+  ),
+
+  /// [`crate::ImageEncoder::embed_preprocessed`] was called on an MLX-backed
+  /// encoder. The opaque [`crate::PreprocessedBatch`] is the ONNX path's
+  /// normalization-contract carrier; the MLX backend builds its own device
+  /// tensors from raw RGB inside `mlxrs`, so it has no use for a
+  /// pre-built batch. Call [`crate::ImageEncoder::embed_pixels`] /
+  /// [`crate::ImageEncoder::embed_pixels_batch`] instead (both backends
+  /// support them). Compiled only on the Apple-Silicon target.
+  #[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+  #[error(
+    "embed_preprocessed is not supported by the MLX backend; use embed_pixels / \
+     embed_pixels_batch (the MLX backend preprocesses raw RGB internally)"
+  )]
+  MlxUnsupportedPreprocessedBatch,
 }
 
-/// Crate-local `Result` alias parameterized over [`Error`].
+#[cfg(all(feature = "inference", target_os = "macos", target_arch = "aarch64"))]
+impl Error {
+  /// Build an [`Error::Mlx`] from a static reason string.
+  pub(crate) fn mlx(reason: &'static str) -> Self {
+    Error::Mlx(reason.to_string())
+  }
+
+  /// Build an [`Error::Mlx`] from an owned reason string.
+  pub(crate) fn mlx_owned(reason: String) -> Self {
+    Error::Mlx(reason)
+  }
+
+  /// Convert an `mlxrs::Error` into [`Error::Mlx`], capturing its `Display`.
+  pub(crate) fn from_mlx(source: mlxrs::Error) -> Self {
+    Error::Mlx(source.to_string())
+  }
+}
+
+/// Crate-local `Result` alias parameterized over [`enum@Error`].
 pub type Result<T> = core::result::Result<T, Error>;
 
 #[cfg(test)]

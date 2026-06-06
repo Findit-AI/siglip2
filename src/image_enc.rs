@@ -13,12 +13,40 @@ use crate::{
   preproc::{PreprocessedBatch, Preprocessor},
 };
 
-/// SigLIP2 NaFlex vision-tower inference. Owns one `ort::Session`.
+/// SigLIP2 NaFlex vision-tower inference.
 ///
-/// `ImageEncoder: Send + !Sync` — `ort::Session` is `!Sync`. Workers wanting
-/// parallelism instantiate one `ImageEncoder` per thread, or share one behind
-/// a `Mutex<ImageEncoder>`.
+/// Holds either an ONNX Runtime session (the `ort` backend) or — on Apple
+/// Silicon, when [`Self::from_dir`] auto-routes to it — an `mlxrs` MLX model
+/// (the MLX backend), behind one public API. Both return the same 768-dim
+/// L2-normalized [`Embedding`].
+///
+/// Auto-trait reality is platform-conditional:
+/// - On every target **except** `aarch64-apple-darwin`: `Send + !Sync`. Only the
+///   `ort` backend is compiled; `ort::Session` is `Send` but `!Sync`.
+/// - On `aarch64-apple-darwin`: `!Send + !Sync`. The MLX backend variant is
+///   compiled in unconditionally, and it holds an `Rc`-backed MLX model whose
+///   device handles are not `Send` — so the enum is `!Send` for *every*
+///   `ImageEncoder` on this target, including `ort`-backed ones (an enum is
+///   `Send` only if all its variants are).
+///
+/// Either way the type is `!Sync`. Workers wanting parallelism instantiate one
+/// `ImageEncoder` per thread; off Apple Silicon they may alternatively share one
+/// behind a `Mutex<ImageEncoder>`.
 pub struct ImageEncoder {
+  backend: ImageBackend,
+}
+
+/// The inference backend behind an [`ImageEncoder`]: the ONNX Runtime path, or
+/// (Apple Silicon, auto-routed) the MLX path.
+enum ImageBackend {
+  Ort(OrtImageEncoder),
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  Mlx(crate::mlx::MlxModel),
+}
+
+/// The ONNX Runtime image encoder. Owns one `ort::Session` plus the NaFlex
+/// preprocessor and reusable scratch.
+struct OrtImageEncoder {
   session: ort::session::Session,
   pre: Preprocessor,
   opts: Options,
@@ -52,6 +80,104 @@ impl ImageEncoder {
     Self::from_ort_session_with_options(session, opts)
   }
 
+  /// Load the vision tower from a **checkpoint directory**, automatically
+  /// picking the best backend for the platform — there is no backend knob.
+  ///
+  /// On Apple Silicon (`aarch64-apple-darwin`) the directory is probed and routes
+  /// to the `mlxrs` **MLX** Metal backend when the vision ONNX graph this
+  /// constructor needs (`vision_model_naflex_256.onnx`) is absent and an MLX
+  /// checkpoint (`config.json` + `model.safetensors`) is present; otherwise the
+  /// **ONNX** vision graph is loaded via ONNX Runtime. On every other platform
+  /// only the ONNX backend is compiled, so the ONNX graph is loaded
+  /// unconditionally.
+  ///
+  /// **Not available on wasm32** (the ONNX session constructors are gated out —
+  /// see [`Self::from_files`]).
+  #[cfg(not(target_arch = "wasm32"))]
+  pub fn from_dir(dir: &Path) -> Result<Self> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if crate::backend_select::prefer_mlx(dir, &[crate::backend_select::VISION_ONNX]) {
+      return Self::from_mlx_dir(dir);
+    }
+    Self::from_onnx_dir(dir)
+  }
+
+  /// ONNX dispatch target for [`Self::from_dir`]: load the vision ONNX graph
+  /// (`crate::backend_select`'s `VISION_ONNX`) from `dir`. Crate-internal — the
+  /// user's directory entry point is [`Self::from_dir`].
+  #[cfg(not(target_arch = "wasm32"))]
+  pub(crate) fn from_onnx_dir(dir: &Path) -> Result<Self> {
+    Self::from_files(&dir.join(crate::backend_select::VISION_ONNX))
+  }
+
+  /// MLX dispatch target for [`Self::from_dir`]: load from an **MLX checkpoint
+  /// directory** (`config.json` + `model.safetensors`) using the `mlxrs` Metal
+  /// backend. The vision tower runs on the GPU via MLX.
+  ///
+  /// Crate-internal — the user's directory entry point is [`Self::from_dir`],
+  /// which auto-routes here on Apple Silicon when an MLX checkpoint is present.
+  /// The checkpoint is an MLX-format SigLIP2 NaFlex export (e.g. an
+  /// `mlx-community` mirror of `google/siglip2-base-patch16-naflex`), not the
+  /// ONNX graphs the `from_files` constructors load.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  pub(crate) fn from_mlx_dir(dir: &Path) -> Result<Self> {
+    let model = crate::mlx::MlxModel::from_dir(dir)?;
+    Ok(Self {
+      backend: ImageBackend::Mlx(model),
+    })
+  }
+
+  /// Build from a pre-loaded MLX model — used by `Siglip2::from_mlx_dir` so a
+  /// single shared model backs both the image and text encoders.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  pub(crate) fn from_mlx_model(model: crate::mlx::MlxModel) -> Self {
+    Self {
+      backend: ImageBackend::Mlx(model),
+    }
+  }
+
+  /// Load the **MLX** vision tower from an exact `model.safetensors` file path
+  /// (Apple Silicon only). The `config.json` is read from the weight file's
+  /// parent directory (`weights.parent()`).
+  ///
+  /// This is the explicit-format counterpart to the auto-routing
+  /// [`Self::from_dir`]: use it when you already know the checkpoint is an MLX
+  /// safetensors file and where it lives. There is no ONNX fallback — this
+  /// constructor always builds the MLX backend.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+  pub fn from_safetensors(weights: &Path) -> Result<Self> {
+    Ok(Self {
+      backend: ImageBackend::Mlx(crate::mlx::MlxModel::from_safetensors(weights)?),
+    })
+  }
+
+  /// Load the **MLX** vision tower from an exact `*.npz` file path (Apple Silicon
+  /// only). The `config.json` is read from the weight file's parent directory
+  /// (`weights.parent()`).
+  ///
+  /// Explicit-format MLX constructor (see [`Self::from_safetensors`]); always
+  /// builds the MLX backend, no ONNX fallback.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "npz"))]
+  pub fn from_npz(weights: &Path) -> Result<Self> {
+    Ok(Self {
+      backend: ImageBackend::Mlx(crate::mlx::MlxModel::from_npz(weights)?),
+    })
+  }
+
+  /// Load the **MLX** vision tower from an exact `*.gguf` file path (Apple Silicon
+  /// only). The `config.json` is read from the weight file's parent directory
+  /// (`weights.parent()`); the gguf's embedded metadata is NOT mapped to a config,
+  /// so a sibling `config.json` is still required.
+  ///
+  /// Explicit-format MLX constructor (see [`Self::from_safetensors`]); always
+  /// builds the MLX backend, no ONNX fallback.
+  #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "gguf"))]
+  pub fn from_gguf(weights: &Path) -> Result<Self> {
+    Ok(Self {
+      backend: ImageBackend::Mlx(crate::mlx::MlxModel::from_gguf(weights)?),
+    })
+  }
+
   /// Build from a caller-built session. Validates input/output shapes per
   ///.2 against the SigLIP2-base/naflex/256 contract.
   pub fn from_ort_session(session: ort::session::Session) -> Result<Self> {
@@ -62,10 +188,12 @@ impl ImageEncoder {
     validate_image_session(&session, opts.batch().max_num_patches())?;
     let pre = Preprocessor::new(opts)?;
     Ok(Self {
-      session,
-      pre,
-      opts,
-      embed_pixels_scratch: None,
+      backend: ImageBackend::Ort(OrtImageEncoder {
+        session,
+        pre,
+        opts,
+        embed_pixels_scratch: None,
+      }),
     })
   }
 
@@ -75,6 +203,68 @@ impl ImageEncoder {
   /// [`Self::embed_pixels_batch`] — it amortizes the per-call ORT
   /// overhead.
   pub fn embed_pixels(&mut self, view: ImageView<'_>) -> Result<Embedding> {
+    match &mut self.backend {
+      ImageBackend::Ort(ort) => ort.embed_pixels(view),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      ImageBackend::Mlx(mlx) => mlx.embed_pixels(view),
+    }
+  }
+
+  /// Returns `Ok(vec![])` for an empty input slice (no inference call).
+  /// Returns `Error::BatchTooLarge` when `views.len() > opts.batch.max_batch_size`
+  /// (ORT backend). The returned `Vec` preserves input order. Aborts on the
+  /// first failing input with `Error::Batch { index, source }`.
+  pub fn embed_pixels_batch(&mut self, views: &[ImageView<'_>]) -> Result<Vec<Embedding>> {
+    match &mut self.backend {
+      ImageBackend::Ort(ort) => ort.embed_pixels_batch(views),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      ImageBackend::Mlx(mlx) => mlx.embed_pixels_batch(views),
+    }
+  }
+
+  /// Runs inference on a [`PreprocessedBatch`]. **ORT backend only** — the MLX
+  /// backend preprocesses internally via `mlxrs` and returns
+  /// [`Error::MlxUnsupportedPreprocessedBatch`] here (the typed
+  /// [`PreprocessedBatch`] is the ONNX path's normalization-contract carrier;
+  /// the MLX path builds its own device tensors). Use [`Self::embed_pixels`] /
+  /// [`Self::embed_pixels_batch`] for both backends.
+  pub fn embed_preprocessed(&mut self, batch: &PreprocessedBatch) -> Result<Vec<Embedding>> {
+    match &mut self.backend {
+      ImageBackend::Ort(ort) => ort.embed_preprocessed(batch),
+      #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+      ImageBackend::Mlx(_) => Err(Error::MlxUnsupportedPreprocessedBatch),
+    }
+  }
+
+  /// Decode JPEG/PNG from disk and call `embed_pixels`. Requires feature
+  /// `decoders`. Supported formats: JPEG and PNG only. Works with either
+  /// backend (decode is backend-independent).
+  #[cfg(all(feature = "decoders", not(target_arch = "wasm32")))]
+  pub fn embed_path(&mut self, path: &Path) -> Result<Embedding> {
+    let img = decode_with_orientation(path)?;
+    let (w, h) = img.dimensions();
+    let buf = img.into_raw();
+    let view = ImageView::new(&buf, w, h)?;
+    self.embed_pixels(view)
+  }
+
+  /// Run a single throwaway inference to amortize first-call cost (ORT graph
+  /// compilation; MLX kernel JIT / weight residency).
+  pub fn warmup(&mut self) -> Result<()> {
+    let rgb = vec![128u8; 64 * 64 * 3];
+    let view = ImageView::new(&rgb, 64, 64)?;
+    let _ = self.embed_pixels(view)?;
+    Ok(())
+  }
+}
+
+impl OrtImageEncoder {
+  /// Encode a single pre-decoded RGB image and return its 768-dim
+  /// L2-normalized [`Embedding`]. Reuses an internal NaFlex
+  /// preprocessing scratch buffer across calls. For batches, prefer
+  /// [`Self::embed_pixels_batch`] — it amortizes the per-call ORT
+  /// overhead.
+  fn embed_pixels(&mut self, view: ImageView<'_>) -> Result<Embedding> {
     // Take the scratch out (or lazily allocate on first call), use
     // it, then put it back so the next call reuses the same buffers.
     // The take/put-back dance is what lets us hold `&mut batch` and
@@ -107,7 +297,7 @@ impl ImageEncoder {
   /// `batch_size` and `views.len()`, then reuses it across chunks via
   /// [`Preprocessor::fill_batch`] — same per-call alloc cost as the
   /// pre-refactor slice-based path.
-  pub fn embed_pixels_batch(&mut self, views: &[ImageView<'_>]) -> Result<Vec<Embedding>> {
+  fn embed_pixels_batch(&mut self, views: &[ImageView<'_>]) -> Result<Vec<Embedding>> {
     if views.is_empty() {
       return Ok(Vec::new());
     }
@@ -160,7 +350,7 @@ impl ImageEncoder {
   ///
   /// Returns `Error::MaxNumPatchesMismatch` if the batch was built
   /// under a different patch budget than this encoder's `Options`.
-  pub fn embed_preprocessed(&mut self, batch: &PreprocessedBatch) -> Result<Vec<Embedding>> {
+  fn embed_preprocessed(&mut self, batch: &PreprocessedBatch) -> Result<Vec<Embedding>> {
     if batch.is_empty() {
       return Ok(Vec::new());
     }
@@ -190,52 +380,6 @@ impl ImageEncoder {
       batch.spatial_shapes_slice(),
       batch.len(),
     )
-  }
-
-  /// Decode JPEG/PNG from disk and call `embed_pixels`. Requires feature
-  /// `decoders`. Supported formats: JPEG and PNG only.
-  ///
-  /// Honors EXIF orientation. Phone-camera JPEGs commonly store pixels
-  /// in the sensor's native landscape grid with an EXIF orientation tag
-  /// (e.g., `Rotate90CW`) that the displayed-correct viewer applies on
-  /// the way out. Without this, NaFlex would receive the stored grid,
-  /// not the displayed image, and silently produce embeddings /
-  /// rankings for the wrong orientation. PNG / formats that don't
-  /// carry orientation metadata fall back to `Orientation::NoTransforms`
-  /// (the trait default in `image::ImageDecoder`).
-  ///
-  /// **Not available on wasm32** (no filesystem in the standard wasm
-  /// target).
-  #[cfg(all(feature = "decoders", not(target_arch = "wasm32")))]
-  pub fn embed_path(&mut self, path: &Path) -> Result<Embedding> {
-    let img = decode_with_orientation(path)?;
-    let (w, h) = img.dimensions();
-    let buf = img.into_raw();
-    let view = ImageView::new(&buf, w, h)?;
-    self.embed_pixels(view)
-  }
-
-  /// Run a single throwaway inference to amortize ORT's first-call
-  /// graph-compilation cost. The internal warm-up input is shaped to
-  /// hit the same `[1, max_num_patches, 768]` post-NaFlex tensor
-  /// shape that typical inference inputs converge to, so the kernels
-  /// ORT selects survive into the production path.
-  pub fn warmup(&mut self) -> Result<()> {
-    // 64x64 input converges to a 16x16 = 256-patch grid, the same shape
-    // typical inference inputs (224x224 → 16x16, 1080x1920 → 12x21,
-    // 64x64 → 16x16, …) all hit. ORT selects GEMM kernels based on the
-    // post-NaFlex tensor shape `[1, max_num_patches, 768]`; warming up
-    // at the active-patch count we'll see in production avoids paying
-    // the kernel-selection cost on the first real call.
-    //
-    // The previous 1x1 warmup hit only 49 active patches (the binary
-    // search in `patch_grid` is capped by `scale_max = 100`, so a 1x1
-    // image rounds up to a 7x7 grid), which selected smaller kernels
-    // than the typical 256-patch path.
-    let rgb = vec![128u8; 64 * 64 * 3];
-    let view = ImageView::new(&rgb, 64, 64)?;
-    let _ = self.embed_pixels(view)?;
-    Ok(())
   }
 }
 
