@@ -37,6 +37,26 @@ image        = { version = "0.25", default-features = false }
 serde        = { version = "1", features = ["derive"], optional = true }
 serde_json   = { version = "1", optional = true }
 
+# ── MLX (mlxrs) inference backend — Apple Silicon only ──────────────────
+#
+# `mlxrs` binds the Metal-backed MLX C++ runtime through `mlx-c` FFI and
+# only builds on `aarch64-apple-darwin`, so it is declared under a target
+# table — it never enters the dependency graph on any other host. It is
+# **non-optional** there (no Cargo feature gates it): the crate picks the best
+# backend per platform automatically, with no user-facing knob. On macOS/arm64
+# the public `from_dir` constructors auto-route to the MLX backend when an MLX
+# checkpoint is present and fall back to ONNX otherwise; on every other platform
+# only the ONNX path is compiled. The `siglip2-naflex` feature gives the SigLIP2
+# NaFlex dual-tower model + NaFlex preprocessing.
+#
+# Build-cost note: because this is non-optional on macOS/arm64, EVERY
+# macOS/arm64 build — even an ONNX-only `--no-default-features` one — compiles
+# `mlxrs`, which builds the MLX C++/Metal runtime from source on a cold target
+# directory. This is the deliberate cost of the "no opt-out, best-backend-by-
+# platform" directive; non-Apple-Silicon hosts never pay it.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+mlxrs = { path = "../mlxrs/mlxrs", default-features = false, features = ["siglip2-naflex"] }
+
 # `serde_json` is also a runtime dep behind `feature = "serde"`, but
 # the integration tests use it to load fixture JSON files (e.g.
 # `text_prompts.json`) regardless of which feature combo runs. Putting
@@ -73,6 +93,19 @@ default   = ["inference", "bundled", "decoders"]
 # Disable on wasm via `--no-default-features` to compile the
 # preprocessing + similarity + SIMD subset.
 inference = ["dep:ort", "dep:tokenizers"]
+# Widen which weight FORMATS the auto-selected MLX (`mlxrs`) backend accepts on
+# Apple Silicon. Off by default, the MLX path reads only `model.safetensors`
+# (and the crate builds everywhere exactly as before). With `npz`/`gguf` on, the
+# loader's format detector additionally probes a `*.npz`/`*.gguf`, and the
+# backend probe routes such a dir to MLX. Each enables the matching `mlxrs`
+# feature; `mlxrs` is a macOS-arm64-only target dependency, so on every other
+# target the `mlxrs/<fmt>` activation is a harmless no-op (the npz/gguf detection
+# code is itself `#[cfg(feature = ...)]`-gated, so it isn't compiled). These are
+# NOT a backend knob — MLX stays auto-selected by platform; they only widen the
+# accepted weight formats. (gguf is a weight load seam: its embedded metadata is
+# not mapped to a config — a `config.json` is still required alongside it.)
+npz       = ["mlxrs/npz"]
+gguf      = ["mlxrs/gguf"]
 # Embeds the 32.8 MB text-tower tokenizer.json via include_bytes!.
 # The vision tower has no tokenizer; this feature is text-side only.
 # Implies `inference` because the bundled-tokenizer constructors live
@@ -82,6 +115,13 @@ bundled   = ["inference"]
 # `ImageEncoder::embed_path` (§3.3). Without this, callers must supply
 # already-decoded RGB pixels via `ImageView`.
 decoders  = ["image/jpeg", "image/png"]
+# NOTE: there is intentionally no `mlx` feature. The MLX (`mlxrs`) Metal
+# backend is selected automatically by platform — see the `mlxrs` target
+# dependency above and the `from_dir` auto-routing in `src/siglip2.rs` /
+# `src/image_enc.rs` / `src/text_enc.rs`. On macOS/arm64 it compiles
+# unconditionally and the public constructors route to it when an MLX
+# checkpoint is present; elsewhere only the ONNX path exists. Removing the
+# user-facing knob is deliberate (best-backend-by-platform, no opt-out).
 # Pulls `serde` + `serde_json` and activates JSON-driven calibration
 # loading. With `serde` on you get:
 # - `Serialize` / `Deserialize` on `Options`, `BatchOptions`,

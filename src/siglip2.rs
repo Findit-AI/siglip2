@@ -96,6 +96,98 @@ impl Siglip2 {
     })
   }
 
+  /// Load both encoders from a **checkpoint directory**, automatically picking
+  /// the best backend for the platform — there is no backend knob.
+  ///
+  /// On Apple Silicon (`aarch64-apple-darwin`) the directory is probed and routes
+  /// to the `mlxrs` **MLX** Metal backend when **neither** of the ONNX graphs
+  /// this constructor needs (`vision_model_naflex_256.onnx` and
+  /// `text_model_naflex.onnx`) is present and an MLX checkpoint
+  /// (`config.json` plus `model.safetensors`) is present; otherwise the **ONNX**
+  /// Runtime backend is used. Because `Siglip2` loads both towers, the presence
+  /// of *either* ONNX graph routes the whole wrapper to ONNX. On every other
+  /// platform only the ONNX backend is compiled, so an ONNX checkpoint is loaded
+  /// unconditionally.
+  ///
+  /// The tokenizer is `tokenizer.json` in the same directory; calibration is
+  /// the bundled pinned release values ([`Calibration::bundled`]).
+  ///
+  /// Requires `feature = "bundled"` (for the pinned [`Calibration`] and, on the
+  /// ONNX path, the bundled tokenizer constructors). **Not available on
+  /// wasm32** (the ONNX session constructors are gated out there — see
+  /// [`Self::bundled`]).
+  #[cfg(all(feature = "bundled", not(target_arch = "wasm32")))]
+  pub fn from_dir(dir: &Path) -> Result<Self> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if crate::backend_select::prefer_mlx(
+      dir,
+      &[
+        crate::backend_select::VISION_ONNX,
+        crate::backend_select::TEXT_ONNX,
+      ],
+    ) {
+      return Self::from_mlx_dir(dir);
+    }
+    Self::from_onnx_dir(dir)
+  }
+
+  /// ONNX dispatch target for [`Self::from_dir`]: load the SigLIP2 NaFlex ONNX
+  /// graphs (`crate::backend_select`'s `VISION_ONNX` / `TEXT_ONNX`) from `dir`,
+  /// with the tokenizer read from **`dir/tokenizer.json`** and calibration from
+  /// the bundled pinned release values ([`Calibration::bundled`]). Kept
+  /// crate-internal — the user's entry point is [`Self::from_dir`] (or the
+  /// explicit [`Self::from_files`] / [`Self::bundled`] file-path constructors).
+  ///
+  /// Composed from the per-encoder `from_onnx_dir` constructors rather than
+  /// [`Self::bundled`]: the latter loads the embedded `BUNDLED_TOKENIZER`, which
+  /// would silently produce wrong token ids for an ONNX checkpoint / fine-tune
+  /// shipping its own `tokenizer.json`. [`TextEncoder::from_onnx_dir`] reads the
+  /// directory's tokenizer (mirroring its sibling [`ImageEncoder::from_onnx_dir`]
+  /// for the vision graph), so the assembled `Siglip2` honors the checkpoint's
+  /// own tokenizer.
+  #[cfg(all(feature = "bundled", not(target_arch = "wasm32")))]
+  pub(crate) fn from_onnx_dir(dir: &Path) -> Result<Self> {
+    let image = ImageEncoder::from_onnx_dir(dir)?;
+    let text = TextEncoder::from_onnx_dir(dir)?;
+    let calibration = Calibration::bundled();
+    Ok(Self {
+      image,
+      text,
+      calibration,
+    })
+  }
+
+  /// MLX dispatch target for [`Self::from_dir`]: load from an **MLX checkpoint
+  /// directory** (`config.json` + `model.safetensors` + `tokenizer.json`) using
+  /// the `mlxrs` Metal backend. A single shared model backs both the image and
+  /// text encoders.
+  ///
+  /// Kept crate-internal — the user's entry point is [`Self::from_dir`], which
+  /// auto-routes here on Apple Silicon when an MLX checkpoint is present.
+  /// Calibration uses the bundled pinned release values
+  /// ([`Calibration::bundled`]) — an MLX checkpoint's `config.json` carries no
+  /// sigmoid scale/bias, but the model's own `logit_scale` / `logit_bias`
+  /// tensors are applied directly by `mlxrs` for raw-logit scoring; the
+  /// bundled `Calibration` here is what [`Self::classify`] uses for the
+  /// `sigmoid(exp(scale)·cos + bias)` probability.
+  #[cfg(all(feature = "bundled", target_os = "macos", target_arch = "aarch64"))]
+  pub(crate) fn from_mlx_dir(dir: &Path) -> Result<Self> {
+    let model = crate::mlx::MlxModel::from_dir(dir)?;
+    // Prepare the tokenizer the same way `TextEncoder::from_mlx_dir` does:
+    // disable the serialized padding/truncation and install the SigLIP2
+    // lowercasing normalizer (the MLX path builds the fixed-length-64 row
+    // manually under the sticky-EOS contract).
+    let tokenizer = crate::text_enc::prepare_mlx_tokenizer(&dir.join("tokenizer.json"))?;
+    let image = ImageEncoder::from_mlx_model(model.clone());
+    let text = TextEncoder::from_mlx_model(model, tokenizer);
+    let calibration = Calibration::bundled();
+    Ok(Self {
+      image,
+      text,
+      calibration,
+    })
+  }
+
   /// Build from caller-owned components. **Re-validates `calibration`** through
   /// the same pipeline as `Calibration::from_path` / `from_bytes` use, so a
   /// hand-built `Calibration::new(NaN, NaN)` cannot reach `classify`.
