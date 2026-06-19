@@ -32,7 +32,7 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Install Rust
       run: rustup update stable && rustup default stable && rustup component add rustfmt
     - name: Check formatting
@@ -49,7 +49,7 @@ jobs:
           - windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Install Rust
       # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
       run: rustup update stable --no-self-update && rustup default stable && rustup component add clippy
@@ -99,7 +99,7 @@ jobs:
           # Codex round-20 finding [high].
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Cache cargo build and registry
         uses: actions/cache@v5
         with:
@@ -135,7 +135,7 @@ jobs:
     name: AVX-512 (Intel SDE)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install Rust
         run: rustup update stable && rustup default stable
       - name: Cache cargo build and registry
@@ -211,7 +211,7 @@ jobs:
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Cache cargo build and registry
         uses: actions/cache@v5
         with:
@@ -245,7 +245,7 @@ jobs:
     name: wasm32 simd128 runtime tests (wasmtime)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install Rust
         run: rustup update stable && rustup default stable && rustup target add wasm32-wasip1
       - name: Cache cargo build and registry
@@ -305,7 +305,7 @@ jobs:
           - windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Cache cargo build and registry
       uses: actions/cache@v5
       with:
@@ -334,7 +334,7 @@ jobs:
           - windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Cache cargo build and registry
       uses: actions/cache@v5
       with:
@@ -386,7 +386,7 @@ jobs:
     name: sanitizer
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Cache cargo build and registry
         uses: actions/cache@v5
         with:
@@ -425,7 +425,7 @@ jobs:
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Cache cargo build and registry
         uses: actions/cache@v5
         with:
@@ -461,7 +461,7 @@ jobs:
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Cache cargo build and registry
         uses: actions/cache@v5
         with:
